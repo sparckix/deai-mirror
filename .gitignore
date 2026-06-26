@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+benchmark/_generated/
+.env
+out/
+.DS_Store
+.lexcache/
+# harvested tell candidates accumulate spans from whatever drafts you run — keep local, regenerate with `candidates`
+tell_candidates.jsonl
+# per-corpus caches the tool writes into corpora/<venue>/ at ingestion
+.register.md
+.style_profile.md
+.conventions_profile.md
+.prob_ai_baseline.jsonl

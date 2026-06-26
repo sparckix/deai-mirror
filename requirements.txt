@@ -1,0 +1,6 @@
+spacy>=3.7
+nltk>=3.8
+numpy
+scikit-learn
+textstat
+sentence-transformers   # optional: the neural style-embedding layer (deai.py style); pulls torch

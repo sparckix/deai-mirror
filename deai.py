@@ -26,6 +26,7 @@ CLI:
   python deai.py styleprofile corpus_dir/ [--refresh]           # EMERGENT per-corpus tone/style categories (does/does-not + score); caches .style_profile.{json,md}
   python deai.py baseline corpus_dir/ [--draft X] [--only m,m]  # HUMAN PROB_AI baseline for a venue (caches .prob_ai_baseline.jsonl); --draft places a draft against the band
   python deai.py register draft.md corpus_dir/ [--no-llm]       # SELF-EXPLAINING alignment: surface & syntactic axes (glossed) + semantic register (draft-vs-emergent-categories)
+  python deai.py taste    draft.md [--exemplars DIR] [--no-llm] # CEILING: deep discourse-stance proxies + LLM taste dims vs EXEMPLARS (World Models…), not the venue corpus
   python deai.py excess   draft.md corpus_dir/ "topic"          # topic-controlled lexical over-use (Monroe log-odds + AI-matched style ref + wordfreq)
 Run with the venv python (spaCy/nltk) for mirror/infer/judge; check works on plain python3.
 """
@@ -2074,6 +2075,477 @@ def cites(path, bib=None, neuro=True):
             try: print(f"\n### {spec[0]}\n{_judge_call(prompt, spec, mt=1500)}")
             except Exception as e: print(f"\n### {spec[0]}: unavailable ({type(e).__name__}: {str(e)[:80]})")
 
+# ════════════ taste: the CEILING (deep discourse-stance tells + exemplar-anchored taste virtues) ════════════
+# The other commands measure the FLOOR (is the draft inside the venue corpus's distribution). `taste` measures the
+# CEILING: deep stance tells that survive surface de-slopping (the HBR run had regex meta_narration=0 while judges
+# still saw saturated meta-narration), plus the POSITIVE virtues of tasteful technical writing (World Models / Karpathy
+# / Olah standard). The reference is the 3 EXEMPLARS, not the venue corpus — these virtues are venue-independent.
+#   A. seven DETERMINISTIC proxies (pure python, no spaCy) — computed for the draft AND each exemplar -> a band.
+#   B. six LLM taste dims scored by the _roster() panel, with the exemplar OPENINGS prepended as the "90+" anchor.
+# embedded_self_score>0 is a HARD FAIL printed first (an embedded model self-evaluation in a paper is never tasteful).
+
+_TASTE_EXEMPLAR_DEFAULT = str(pathlib.Path(__file__).resolve().parent / "corpora" / "taste_exemplars")
+
+# ── A. deterministic proxies. Each takes RAW markdown/LaTeX text, returns a number, and survives empty/degenerate
+#    input (no div-by-zero, no crash). prose()/_dsents()/_split_sections() are reused so the unit of analysis matches
+#    the rest of the tool. Rates are per-1000-words so docs of different length compare. ──
+_PAYOFF_RE = re.compile(r"\b(we (show|find|report|demonstrate|prove)|the result\b|figure \d|table \d|"
+                        r"our (main )?(finding|contribution|result) is|the (main )?(finding|result|upshot) is)\b", re.I)
+_CAVEAT_RE = re.compile(r"\b(caveat|limitation|does not establish|do not establish|awaits replication|cannot prove|"
+                        r"open question|beyond (the )?scope|roadmap|to be clear|not (a )?claim|make no claim|"
+                        r"existence proof|preliminary|illustrative|tentative|we concede|we acknowledge)\b", re.I)
+_CONNECTIVE_RE = re.compile(r"\b(therefore|however|moreover|furthermore|thus|hence|importantly|notably|crucially|"
+                            r"consequently|in other words|that is|as such)\b", re.I)
+_HEDGE_RE = re.compile(r"\b(may|might|could|tends to|somewhat|arguably|largely|generally|in part|"
+                       r"to some extent|relatively)\b", re.I)
+_EXAMPLE_RE = re.compile(r"\b(for example|for instance|consider|imagine|like a )\b", re.I)
+# embedded model self-evaluation: the draft quotes a model that scored/rated IT. Never tasteful in a finished paper.
+# Only GENUINE paper-self-reviews (a model scored THIS draft/paper) — NOT experimental "X/100" result data,
+# which is legitimate findings (e.g. "the judge scored the gaming thesis 97/100" is a result, not a self-eval).
+_SELFSCORE_RE = re.compile(
+    r"scored the draft|\breview of this (paper|draft|manuscript)\b|\bself-score\b|"
+    r"\b(scored|rated)\b[^.]{0,30}\bthis (paper|draft|manuscript)\b|"
+    r"\bthis (paper|draft|manuscript)\b[^.]{0,50}\b(scored|rated)\b[^.]{0,15}\d+\s*/\s*100", re.I)
+
+# ── research-grounded deterministic cores (Coh-Metrix easability factors, Hyland interactional metadiscourse,
+#    Helen Sword "Writer's Diet"). Pure regex/wordlist — POS approximated by surface morphology + closed-class
+#    lists, no spaCy. Every wordlist is a closed set so the rates are reproducible and venue-independent. ──
+# Sword "Writer's Diet" categories. be-verbs as a verb sense (the closed set of copula/auxiliary forms).
+_WD_BE_RE   = re.compile(r"\b(?:is|are|was|were|be|been|being|am)\b|(?<=\w)'(?:s|re)\b", re.I)
+# zombie nouns: nominalizing suffixes (Sword's headline "flabby" signal; >6% of words = flabby).
+_WD_NOML_RE = re.compile(r"\b[a-z]{3,}(?:tion|sion|ment|ity|ness|ance|ence|ism|ization|isation)s?\b", re.I)
+_WD_PREPS = {"of","in","on","to","for","with","by","at","from","into","over","under","through","between","among",
+             "about","against","during","without","before","after","above","below","toward","towards","upon",
+             "within","across","behind","beyond","onto","off","than","via","per"}
+_WD_PREP_RE = re.compile(r"\b(" + "|".join(_WD_PREPS) + r")\b", re.I)
+# ad-words = -ly adverbs + a curated academic-adjective list (Sword: adjectives/adverbs that pad).
+_WD_ADJ = {"significant","substantial","considerable","various","key","crucial","novel","robust","comprehensive",
+           "important","critical","essential","fundamental","extensive","numerous","notable","prominent","vital",
+           "effective","efficient","optimal","sophisticated","rigorous","meaningful","valuable","relevant",
+           "diverse","complex","intricate","seamless","powerful","innovative","cutting-edge","state-of-the-art"}
+_WD_ADV_RE = re.compile(r"\b[a-z]{3,}ly\b", re.I)
+_WD_ADJ_RE = re.compile(r"\b(" + "|".join(re.escape(a) for a in _WD_ADJ) + r")\b", re.I)
+# waste-words: it/this/that/there as sentence subjects or expletives (sentence-initial, or after a clause break).
+_WD_WASTE_RE = re.compile(r"(?:^|[.;:,]\s+|\b(?:and|but|or|which|that|because|since|while|when|where)\s+)"
+                          r"(it|this|that|there)\s+(?:is|are|was|were|will|would|can|could|may|might|has|have|had)\b",
+                          re.I)
+
+# Hyland interactional metadiscourse — the four "stance"/defensive families (HIGH = performed rigor = BAD).
+_HY_HEDGE_RE  = re.compile(r"\b(may|might|could|perhaps|possibly|relatively|somewhat|arguably|likely|presumably|"
+                           r"suggest(?:s|ed|ing)?|appear(?:s|ed|ing)?|seem(?:s|ed|ing)?|tend(?:s|ed)? to|"
+                           r"in part|to some extent|in some sense|more or less|fairly)\b", re.I)
+_HY_BOOST_RE  = re.compile(r"\b(clearly|obviously|undoubtedly|certainly|demonstrate(?:s|d)?|establish(?:es|ed)?|"
+                           r"prove(?:s|d|n)?|in fact|indeed|of course|must|definitely|evidently|without doubt|"
+                           r"it is clear|show(?:s|n)? that)\b", re.I)
+_HY_SELF_RE   = re.compile(r"\b(I|we|our|my|us|the author(?:s)?)\b")  # self-mention (case-sensitive on I)
+_HY_ATT_RE    = re.compile(r"\b(importantly|remarkably|surprisingly|unfortunately|crucially|notably|interestingly|"
+                           r"strikingly|curiously|tellingly|regrettably|fortunately|admittedly)\b", re.I)
+# Hyland engagement markers — reader-directed moves (HIGHER = reader-generous = GOOD).
+_HY_ENGAGE_RE = re.compile(r"\b(consider|imagine|note that|suppose|recall|picture|let us|let's|think of|"
+                           r"think about|take(?: the case)?|notice|observe that|you|your|we (?:can|will) see|"
+                           r"ask yourself|remember that)\b", re.I)
+# referential-cohesion stoplist: closed-class function words so the overlap is over content words only.
+_RC_STOP = set("""a an the of in on to for with by at from into over under through and or but nor so yet
+    is are was were be been being am has have had do does did will would shall should can could may might must
+    this that these those it its they them their he she his her him we our us you your i my me as if then than
+    not no nor too very just only also even still such which who whom whose what when where why how all any some
+    each every both either neither one two more most much many few less least own same other another about
+    above below between among during without within across""".split())
+
+def _wcount(p):
+    return len(re.findall(r"\b\w+\b", p)) or 1
+
+def embedded_self_score(text):
+    """HARD FAIL count: embedded model self-evaluations (a judge scored THIS draft N/100, 'self-score', 'GPT-4 judge').
+    Counted on RAW text — these can sit in tables/headings prose() strips. Any hit > 0 is a hard fail in the verdict."""
+    return len(_SELFSCORE_RE.findall(text or ""))
+
+def caveat_before_payoff(text):
+    """# of caveat/hedge sentences BEFORE the first 'payoff' sentence (we show / the result / our finding is). High =
+    performed rigor / reader-hostile front-loading; the exemplars give the idea first. If no payoff marker exists,
+    return the caveat count over the whole prose (a doc that never pays off is itself front-loaded)."""
+    S = _dsents(prose(text or ""))
+    if not S: return 0
+    first = next((i for i, s in enumerate(S) if _PAYOFF_RE.search(s)), len(S))
+    return sum(1 for s in S[:first] if _CAVEAT_RE.search(s))
+
+def section_length_cv(text):
+    """Coefficient of variation of section word counts (LOW = flat 'even coverage', an AI tell; humans are lumpy).
+    Needs >=2 sections; otherwise 0.0 (can't measure lumpiness with one block)."""
+    secs = [_wcount(prose(b)) for _, b in _split_sections(text or "")]
+    secs = [n for n in secs if n > 0]
+    if len(secs) < 2: return 0.0
+    m = st.mean(secs)
+    return round(st.pstdev(secs) / m, 2) if m else 0.0
+
+def connective_density(text):
+    """Explicit logical connectives (therefore/however/moreover/in other words/that is…) per 1000 words. High =
+    over-scaffolded, the model narrating its own logic; the exemplars let the prose carry the logic."""
+    p = prose(text or "")
+    return round(1000 * len(_CONNECTIVE_RE.findall(p)) / _wcount(p), 2)
+
+def apparatus_load(text):
+    """Economy: (markdown table rows + figure refs + appendix-ish headings) per 1000 words. High = rigor-theater,
+    apparatus that armors rather than communicates. Counted on RAW text (tables/headings live outside prose())."""
+    raw = text or ""
+    rows = len(re.findall(r"(?m)^\s*\|", raw))
+    figs = len(re.findall(r"\b(?:figure|fig\.|table|tbl\.)\s*\d", raw, re.I))
+    appx = len(re.findall(r"(?m)^##\s+(?:[A-Z]\b|Appendix\b)", raw))
+    return round(1000 * (rows + figs + appx) / _wcount(prose(raw)), 2)
+
+def concreteness(text):
+    """Concrete anchors per 1000 words: proper nouns (Capitalized mid-sentence, minus sentence-initial), numerals,
+    and example markers (for example / consider / 'like a '). LOW = abstract. No spaCy: the proper-noun proxy is a
+    capitalized word that is NOT the first word of its sentence (so sentence-initial caps are not miscounted)."""
+    p = prose(text or "")
+    S = _dsents(p)
+    propn = 0
+    for s in S:
+        toks = re.findall(r"\b[\w'\-]+\b", s)
+        # skip the sentence's first token; count Capitalized words after it (crude proper-noun proxy)
+        propn += sum(1 for w in toks[1:] if re.match(r"[A-Z][a-z]", w))
+    nums = len(re.findall(r"\b\d+(?:[.,]\d+)?\b", p))
+    egs = len(_EXAMPLE_RE.findall(p))
+    return round(1000 * (propn + nums + egs) / _wcount(p), 2)
+
+def hedge_rhythm(text):
+    """Lockstep hedging: hedges per sentence (mean) AND how EVENLY they spread across paragraphs (low spread + high
+    mean = the model hedging in lockstep). Returns (mean_per_sentence, paragraph_spread_CV). The verdict reads the
+    mean as the primary axis; the spread is the lockstep tell (low CV = mechanical, every paragraph hedges the same)."""
+    p = prose(text or "")
+    S = _dsents(p)
+    if not S: return (0.0, 0.0)
+    mean = round(len(_HEDGE_RE.findall(p)) / len(S), 3)
+    paras = [pp for pp in re.split(r"\n\s*\n", prose_paras(text or "")) if pp.strip()]
+    rates = []
+    for pp in paras:
+        ps = _dsents(pp)
+        if ps: rates.append(len(_HEDGE_RE.findall(pp)) / len(ps))
+    spread = round(st.pstdev(rates) / st.mean(rates), 2) if len(rates) >= 2 and st.mean(rates) else 0.0
+    return (mean, spread)
+
+def prose_paras(text):
+    """prose() collapses everything to one line; for the per-paragraph hedge spread we need paragraph breaks kept.
+    Same cuts as prose() (drop refs/comments/markup lines) but preserve blank-line paragraph boundaries."""
+    t = re.split(r"(?im)^#{1,3}\s*(references|bibliography|appendix)\b", text)[0]
+    t = re.sub(r"<!--.*?-->", "", t, flags=re.DOTALL)
+    out = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s: out.append("")
+        elif s[0] not in "#-*|>" and not s.startswith("[^"): out.append(s)
+    return "\n".join(out)
+
+# ── research-grounded deterministic dims (Sword / Hyland / Coh-Metrix). Each is degenerate-safe: empty or one-
+#    sentence input returns 0.0 and never divides by zero. Rates are per-100-words (Sword) or per-1000-words
+#    (Hyland), matching the source conventions. ──
+def writers_diet(text):
+    """Helen Sword 'Writer's Diet' — the five flab categories as rates per 100 words. Returns a dict; the headline
+    'flabby' signal is nominalization > 6% of words (Sword's threshold). Pure surface morphology + closed lists,
+    no POS tagging. Empty input -> all zeros."""
+    p = prose(text or "")
+    w = len(re.findall(r"\b\w+\b", p))
+    if w == 0:
+        return dict(be_verbs=0.0, nominalization=0.0, prepositions=0.0, ad_words=0.0, waste_words=0.0)
+    R = lambda rx: 100.0 * len(rx.findall(p)) / w
+    adw = 100.0 * (len(_WD_ADV_RE.findall(p)) + len(_WD_ADJ_RE.findall(p))) / w
+    return dict(be_verbs=round(R(_WD_BE_RE), 2), nominalization=round(R(_WD_NOML_RE), 2),
+                prepositions=round(R(_WD_PREP_RE), 2), ad_words=round(adw, 2), waste_words=round(R(_WD_WASTE_RE), 2))
+
+def nominalization_rate(text):
+    """The Writer's Diet headline: zombie-noun rate per 100 words (high_bad; >6% is Sword's 'flabby')."""
+    return writers_diet(text)["nominalization"]
+
+def defensive_metadiscourse(text):
+    """Hyland interactional metadiscourse, the defensive/stance side: hedges + boosters + self-mention + attitude
+    markers per 1000 words. HIGH = performed rigor / defensive stance = BAD. (Deterministic split of the v1 LLM
+    'performed_rigor' dim.) Empty input -> 0.0."""
+    p = prose(text or "")
+    w = _wcount(p)
+    if w <= 1: return 0.0
+    n = (len(_HY_HEDGE_RE.findall(p)) + len(_HY_BOOST_RE.findall(p))
+         + len(_HY_SELF_RE.findall(p)) + len(_HY_ATT_RE.findall(p)))
+    return round(1000.0 * n / w, 2)
+
+_ENGAGE_IMPV = {"show", "hand", "watch", "notice", "see", "look", "take", "start", "begin", "ask", "suppose",
+    "consider", "imagine", "picture", "recall", "think", "note", "compare", "try", "assume", "observe", "contrast"}
+def engagement_markers(text):
+    """Hyland engagement markers + reader-directed imperatives + direct questions, per 1000 words. HIGHER =
+    reader-generous = GOOD (low_bad). Beyond the wordlist, a sentence-initial imperative (Hand a reviewer… / Show…)
+    and a '?' (a question put to the reader) are genuine engagement the closed list misses. Empty input -> 0.0."""
+    p = prose(text or "")
+    w = _wcount(p)
+    if w <= 1: return 0.0
+    n = len(_HY_ENGAGE_RE.findall(p)) + p.count("?")
+    for s in re.split(r"(?<=[.!?])\s+", p):
+        m = re.match(r"\s*([A-Za-z]+)", s)
+        if m and m.group(1).lower() in _ENGAGE_IMPV: n += 1
+    return round(1000.0 * n / w, 2)
+
+def referential_cohesion(text):
+    """Coh-Metrix-style referential cohesion: mean content-word overlap between ADJACENT sentences, normalized by
+    the smaller sentence's content-word count (Jaccard-like, in [0,1]). Content words = tokens >3 chars not in the
+    function-word stoplist. Needs >=2 sentences; otherwise 0.0."""
+    S = _dsents(prose(text or ""))
+    if len(S) < 2: return 0.0
+    def cw(s):
+        return {t for t in re.findall(r"[a-z][a-z'\-]+", s.lower()) if len(t) > 3 and t not in _RC_STOP}
+    sets = [cw(s) for s in S]
+    overlaps = []
+    for a, b in zip(sets, sets[1:]):
+        denom = min(len(a), len(b))
+        if denom == 0: continue
+        overlaps.append(len(a & b) / denom)
+    return round(st.mean(overlaps), 3) if overlaps else 0.0
+
+def formality(text):
+    """Coh-Metrix-style formality composite: a z-combined index that RISES with low burstiness + high
+    nominalization + long sentences (parse-depth proxy, no spaCy) + low concreteness. Reported as a single
+    number (tasteful = LOWER). Components are mapped to a common 0-100ish scale and averaged so the index is
+    venue-stable; empty input -> 0.0."""
+    p = prose(text or "")
+    S = _dsents(p)
+    w = _wcount(p)
+    if len(S) < 2 or w <= 1: return 0.0
+    lens = [len(s.split()) for s in S]
+    mean_sent = st.mean(lens)
+    burst = st.pstdev(lens) / max(mean_sent, 1)           # low burstiness -> formal
+    noml = writers_diet(text)["nominalization"]           # per-100-words, ~0..12
+    conc = concreteness(text)                             # per-1000-words anchors, ~0..60
+    # each component mapped so HIGHER = more formal; averaged. (1-burst): metronomic=formal; mean_sent capped;
+    # nominalization scaled x4 into 0..~50; concreteness inverted (few anchors = formal).
+    flatness = max(0.0, 1.0 - min(burst, 1.0)) * 50.0      # 0..50
+    length   = min(mean_sent, 40.0) / 40.0 * 50.0          # 0..50
+    zombie   = min(noml * 5.0, 50.0)                       # 0..50
+    abstract = max(0.0, 50.0 - min(conc, 50.0))            # 0..50  (low concreteness -> high)
+    return round((flatness + length + zombie + abstract) / 4.0, 2)
+
+def voice(text):
+    """Deterministic voice: burstiness (sentence-length CV) + MTLD lexical diversity, combined. Higher burstiness
+    AND higher lexical diversity = more voice (low_bad). Returns one number on a ~0-100 scale; empty/short -> 0.0."""
+    p = prose(text or "")
+    S = _dsents(p)
+    toks = re.findall(r"[a-z]+", p.lower())
+    if len(S) < 2 or len(toks) < 50: return 0.0
+    lens = [len(s.split()) for s in S]
+    burst = st.pstdev(lens) / max(st.mean(lens), 1)        # ~0.3..1.2
+    mtld = _mtld(toks)                                      # ~40..120
+    # combine: burstiness onto 0..50 (1.2 CV ~ full), MTLD onto 0..50 (120 ~ full).
+    return round(min(burst / 1.2, 1.0) * 50.0 + min(mtld / 120.0, 1.0) * 50.0, 2)
+
+# proxy registry: (label, fn, direction). direction = "low_bad" (draft should be >= exemplar band low) or
+# "high_bad" (draft should be <= exemplar band high). hedge_rhythm returns a tuple; handled specially.
+# Validated keepers only (Phase-2 harness): section_length_cv and hedge_rhythm did NOT discriminate
+# (AI-default essays score 0 for lack of sections, not for taste) — dropped to informational. apparatus_load
+# and connective_density are one-sided (catch one failure mode) but useful, so kept as high_bad checks.
+# v1 ad-hoc proxies (validated keepers) FIRST, then the research-grounded core (Sword / Hyland / Coh-Metrix).
+# direction per spec: defensive_metadiscourse / nominalization / formality = high_bad; engagement_markers /
+# referential_cohesion / concreteness / voice = low_bad.
+_TASTE_DET = [
+    ("caveat_before_payoff",     caveat_before_payoff,     "high_bad"),
+    ("connective_density",       connective_density,       "high_bad"),
+    ("apparatus_load",           apparatus_load,           "high_bad"),
+    ("concreteness",             concreteness,             "low_bad"),
+    # research-grounded deterministic core (validated keepers — separate exemplars from BOTH AI-default and our papers):
+    ("nominalization",           nominalization_rate,      "high_bad"),
+    ("formality",                formality,                "high_bad"),
+    ("engagement_markers",       engagement_markers,       "low_bad"),
+    ("referential_cohesion",     referential_cohesion,     "low_bad"),
+    # defensive_metadiscourse (bundled self-mention dominates → exemplars score high) and voice (burstiness+MTLD,
+    # the Pangram caveat) did NOT discriminate → informational only, computed below.
+]
+
+def taste_det(text):
+    """All deterministic proxies for one document: the v1 keepers + the research-grounded core. embedded_self_score
+    + hedge_rhythm reported separately (the first is a hard fail, the second is a (mean, spread) pair); the full
+    Writer's-Diet breakdown is attached for context."""
+    d = {label: fn(text) for label, fn, _ in _TASTE_DET}
+    d["embedded_self_score"] = embedded_self_score(text)
+    d["section_length_cv"] = section_length_cv(text)   # informational only (dropped from PASS/FAIL; still banded)
+    d["defensive_metadiscourse"] = defensive_metadiscourse(text)  # informational (self-mention dominates the bundle)
+    d["voice"] = voice(text)                           # informational (burstiness+MTLD ≠ taste; Pangram caveat)
+    hm, hs = hedge_rhythm(text)
+    d["hedge_rhythm_mean"], d["hedge_rhythm_spread"] = hm, hs
+    d["writers_diet"] = writers_diet(text)             # full five-category breakdown (context for nominalization)
+    return d
+
+def _taste_band(exemplar_texts):
+    """Deterministic band over the exemplars: per-dim (min, median, max). For the verdict, low_bad dims use the band
+    MIN as the floor the draft must clear; high_bad dims use the band MAX as the ceiling the draft must stay under."""
+    dets = [taste_det(t) for t in exemplar_texts]
+    band = {}
+    keys = [label for label, _, _ in _TASTE_DET] + \
+           ["section_length_cv", "defensive_metadiscourse", "voice",
+            "hedge_rhythm_mean", "hedge_rhythm_spread", "embedded_self_score"]
+    for k in keys:
+        vals = [d[k] for d in dets]
+        band[k] = (min(vals), round(st.median(vals), 2), max(vals))
+    return band
+
+# ── B. LLM taste dims, calibrated by the exemplar openings. ONE prompt, scored by the _roster() panel, robust to
+#    malformed replies (regex-extract a 0-100 score + a one-line evidence/fix per dim; skip a judge that errors). ──
+_TASTE_DIMS = [
+    ("intuition_first",      "builds a mental model / gives the idea before formalism and caveats", "low_bad"),
+    ("narrative_arc",        "problem -> insight -> consequence story, not a flat enumeration of operations/results", "low_bad"),
+    ("reader_generosity",    "anticipates confusion, vivid concrete examples, low gratuitous load", "low_bad"),
+    ("voice",                "a person is present (idiosyncrasy, a surprising word, a risk), not voiceless", "low_bad"),
+    ("performed_rigor",      "INVERSE/high is BAD: credentials its own carefulness, hedges as armor, narrates its own honesty/novelty/structure", "high_bad"),
+    ("economy_of_apparatus", "each table/figure/appendix earns its place by communicating, not as armor", "low_bad"),
+]
+
+def _exemplar_openings(exemplar_texts, words=400):
+    """First ~`words` words of each exemplar's PROSE (markup/nav chrome stripped) — the '90+' calibration anchor."""
+    out = []
+    for i, t in enumerate(exemplar_texts, 1):
+        w = prose(t).split()
+        out.append(f"--- EXEMPLAR {i} (opening) ---\n" + " ".join(w[:words]))
+    return "\n\n".join(out)
+
+def _taste_prompt(draft_body, openings):
+    dims = "\n".join(f"- {name}: {desc}" for name, desc, _ in _TASTE_DIMS)
+    return ("You are a discerning editor judging the TASTE of technical writing — the qualities of the best expository "
+            "prose (think the openings below, which score ~90+). These survive surface copy-editing; you are NOT "
+            "checking grammar or AI cue-words. Score the DRAFT on each dimension 0-100, anchored on the exemplars "
+            "(90+ = as good as them, 50 = competent-but-flat, <30 = the AI-default failure of that dimension). "
+            "performed_rigor is INVERSE: high means the draft armors itself with hedges/self-credentialing/structure-"
+            "narration — score that HIGH only when the draft does that a lot.\n\nDIMENSIONS:\n" + dims +
+            "\n\nReply ONLY with JSON: {\"dims\":[{\"name\":\"<dim>\",\"score\":<0-100>,\"evidence\":\"<short draft "
+            "span or observation>\",\"fix\":\"<one-line fix>\"}]}. Include every dimension.\n\n"
+            "=== THESE OPENINGS ARE THE ~90 ANCHOR ===\n" + openings +
+            "\n\n=== DRAFT TO SCORE ===\n" + draft_body)
+
+def taste_llm(draft_text, exemplar_texts, only=None):
+    """Score the draft on the six taste dims with each roster judge; return {dim: {median, scores, evidence, fix}}.
+    Robust: parse JSON when possible, else regex-extract per-dim scores; a judge that errors is skipped (reported)."""
+    body = prose(re.sub(r"<!--.*?-->", "", draft_text, flags=re.DOTALL))
+    judges = _roster()
+    if only: judges = [j for j in judges if j[0] in only] or judges
+    if not judges: return {}, ["no judges in roster"]
+    per_dim = {name: [] for name, _, _ in _TASTE_DIMS}
+    notes = {name: [] for name, _, _ in _TASTE_DIMS}
+    errs = []
+    openings = _exemplar_openings(exemplar_texts)
+    # taste is a HOLISTIC read of stance/arc/voice — a representative slice suffices and keeps every judge inside its
+    # per-request input limit (kimi 400s on a whole-paper prompt). Cap the draft body; the anchor is never trimmed.
+    body = body[:24000]
+    for spec in judges:
+        prompt = _taste_prompt(body, openings)
+        try:
+            reply = _judge_call(prompt, spec, mt=2200)
+        except Exception as e:
+            errs.append(f"{spec[0]}: {type(e).__name__}: {str(e)[:80]}"); continue
+        got = {}
+        try:
+            obj = _json_from(reply)
+            for d in obj.get("dims", []):
+                nm = _cand_key(d.get("name", ""))
+                sc = d.get("score")
+                if isinstance(sc, (int, float)): got[nm] = (float(sc), d.get("evidence", ""), d.get("fix", ""))
+        except Exception:
+            pass
+        # fallback / fill gaps: regex-extract "name ... <score>" so a malformed reply still yields numbers
+        for name, _, _ in _TASTE_DIMS:
+            if name in got: continue
+            m = re.search(rf"{name}\b[^\d]{{0,40}}(\d{{1,3}})\b", reply, re.I)
+            if m: got[name] = (float(m.group(1)), "", "")
+        for name, _, _ in _TASTE_DIMS:
+            if name in got:
+                sc, ev, fx = got[name]
+                per_dim[name].append(sc)
+                if ev or fx: notes[name].append((spec[0], ev, fx))
+    agg = {}
+    for name, _, _ in _TASTE_DIMS:
+        sc = per_dim[name]
+        agg[name] = {"median": round(st.median(sc), 1) if sc else None, "scores": sc, "notes": notes[name]}
+    return agg, errs
+
+def _load_exemplars(exemplars_dir):
+    paths = sorted(p for p in pathlib.Path(exemplars_dir).glob("*.md")
+                   if not p.name.startswith(".") and p.name.lower() not in ("readme.md", "index.md"))
+    return [(p.stem, p.read_text(errors="ignore")) for p in paths]
+
+def taste(draft_path, exemplars_dir=None, no_llm=False, only=None):
+    """The ceiling check: deterministic proxies + LLM taste dims for the draft vs the exemplar band/anchor."""
+    exemplars_dir = (exemplars_dir or _load_env().get("DEAI_TASTE_EXEMPLARS") or _TASTE_EXEMPLAR_DEFAULT)
+    draft = pathlib.Path(draft_path).read_text(errors="ignore")
+    ex = _load_exemplars(exemplars_dir)
+    print(f"# DEAI TASTE (ceiling) — {pathlib.Path(draft_path).name}  vs  {len(ex)} exemplars ({exemplars_dir})\n", flush=True)
+    if len(ex) < 1:
+        print(f"no exemplars in {exemplars_dir} — taste measures distance from tasteful-writing exemplars you supply.\n"
+              "  Drop a few well-written *.md pieces there, or pass --exemplars DIR / set DEAI_TASTE_EXEMPLARS."); return
+    ex_texts = [t for _, t in ex]
+
+    # ── HARD FAIL first: embedded model self-evaluation ──
+    ess = embedded_self_score(draft)
+    if ess > 0:
+        # _SELFSCORE_RE has capture groups, so show context via match spans (findall would return group tuples)
+        spans = [draft[max(0, m.start() - 30):m.end() + 30].replace("\n", " ").strip()
+                 for m in list(_SELFSCORE_RE.finditer(draft))[:3]]
+        print(f"## HARD FAIL — embedded_self_score = {ess}  (must be 0)")
+        print("   An embedded model self-evaluation (a judge scored THIS draft) is never tasteful in a finished paper.")
+        for s in spans: print(f"     …{s}…")
+        print()
+    else:
+        print("## embedded_self_score = 0  (ok — no embedded model self-evaluation)\n")
+
+    # ── A. deterministic dims vs exemplar band ──
+    band = _taste_band(ex_texts)
+    dd = taste_det(draft)
+    print("## A. Deterministic proxies — draft value vs exemplar band [min / median / max]")
+    print("   The research-grounded deterministic core (Sword / Hyland / Coh-Metrix) is PRIMARY; the LLM panel in")
+    print("   section B is the gestalt integrator, not the arbiter (LLM-as-judge scores carry verbosity / self-")
+    print("   preference / position biases, so they corroborate the measured signal rather than override it).\n")
+    print(f"   {'dim':26}{'draft':>9}{'ex.band (min/med/max)':>26}   verdict")
+    _DET_V1 = {"caveat_before_payoff", "connective_density", "apparatus_load", "concreteness"}
+    def _row(label, direction):
+        v = dd[label]; lo, md, hi = band[label]
+        if direction == "low_bad":
+            ok = v >= lo; verdict = "PASS" if ok else f"FAIL (below band floor {lo})"
+        else:
+            ok = v <= hi; verdict = "PASS" if ok else f"FAIL (above band ceiling {hi})"
+        print(f"   {label:26}{v:>9}{f'{lo} / {md} / {hi}':>26}   {verdict}")
+    print("   -- v1 ad-hoc proxies (validated keepers) --")
+    for label, _, direction in _TASTE_DET:
+        if label in _DET_V1: _row(label, direction)
+    print("   -- research-grounded core (Sword / Hyland / Coh-Metrix) --")
+    for label, _, direction in _TASTE_DET:
+        if label not in _DET_V1: _row(label, direction)
+    # Writer's Diet full five-category breakdown (context; nominalization is the only one in the PASS/FAIL table)
+    wd = dd["writers_diet"]
+    print(f"   {'writers_diet (/100w)':26}{'':>9}{'':>26}   "
+          f"be {wd['be_verbs']}  noml {wd['nominalization']}  prep {wd['prepositions']}  "
+          f"ad {wd['ad_words']}  waste {wd['waste_words']}")
+    # informational only (did not discriminate in the validation harness): hedge_rhythm (mean/spread) + even-coverage
+    hm, hs = dd["hedge_rhythm_mean"], dd["hedge_rhythm_spread"]
+    print(f"   {'hedge_rhythm':26}{f'{hm}/{hs}':>9}{'':>26}   (informational)")
+    print(f"   {'section_length_cv':26}{dd['section_length_cv']:>9}{'':>26}   (informational)")
+    print(f"   {'defensive_metadiscourse':26}{dd['defensive_metadiscourse']:>9}{'':>26}   (informational)")
+    print(f"   {'voice':26}{dd['voice']:>9}{'':>26}   (informational)")
+    print()
+
+    # ── B. LLM taste dims vs exemplar ~90 anchor ──
+    if no_llm:
+        print("## B. LLM taste dims — skipped (--no-llm)\n"); return
+    print("## B. LLM taste dims — draft median vs exemplar ~90 anchor (roster panel)\n", flush=True)
+    agg, errs = taste_llm(draft, ex_texts, only=only)
+    for e in errs: print(f"   [judge unavailable: {e}]")
+    if not any(agg.get(n, {}).get("median") is not None for n, _, _ in _TASTE_DIMS):
+        print("   [no LLM scores returned — deterministic-only result above]\n"); return
+    for name, desc, direction in _TASTE_DIMS:
+        g = agg.get(name, {}); m = g.get("median")
+        if m is None:
+            print(f"   {name:22} no score"); continue
+        if direction == "high_bad":   # performed_rigor: anchor is LOW (the exemplars don't perform rigor)
+            verdict = "PASS" if m <= 40 else "FAIL (armors itself; should be low)"
+        else:
+            verdict = "PASS" if m >= 70 else f"FAIL (anchor is ~90; draft {m})"
+        sc = " ".join(f"{n}" for n in g.get("scores", []))
+        print(f"   {name:22}{m:>6}/100   ({sc})   {verdict}")
+        if verdict.startswith("FAIL"):
+            for jn, ev, fx in g.get("notes", [])[:1]:
+                if ev or fx: print(f"       evidence ({jn}): {ev}" + (f"  -> fix: {fx}" if fx else ""))
+    print()
+
 # ════════════════════════════════ CLI ════════════════════════════════
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -2144,6 +2616,10 @@ if __name__ == "__main__":
     elif cmd == "cites":
         _b = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--bib" and i + 1 < len(sys.argv)), None)
         cites(sys.argv[2], bib=_b, neuro="--no-llm" not in sys.argv)
+    elif cmd == "taste":
+        _ex = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--exemplars" and i + 1 < len(sys.argv)), None)
+        _only = next((sys.argv[i + 1].split(",") for i, a in enumerate(sys.argv) if a == "--only" and i + 1 < len(sys.argv)), None)
+        taste(sys.argv[2], exemplars_dir=_ex, no_llm="--no-llm" in sys.argv, only=_only)
     elif cmd == "conventionsprofile":
         _g = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--genre" and i + 1 < len(sys.argv)), None)
         prof = conventions_profile(sys.argv[2], refresh="--refresh" in sys.argv, genre=_g)

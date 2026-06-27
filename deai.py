@@ -741,6 +741,26 @@ def infer(human_dir, ai_dir):
     print("\n== DISCOVERY: AI-excess words (rate ratio AI/human; topic-confounded — keep the style residue) ==")
     for ratio, hr, ar, k in [c for c in cand if c[0] >= 2.0][::-1][:24][::-1]:
         print(f"  {k:22} {ratio:>5.1f}x   human {hr:.2f}/1k  AI {ar:.2f}/1k")
+    # ── honest composite: leave-one-out flag-count, reported at a strict false-positive bar ──
+    # A feature "flags" a doc when it sits past the human band in its discriminating direction. Each HUMAN doc's
+    # band is computed leave-one-out (from the other human docs), so the composite is not scored in-sample. The
+    # strict TPR is at zero held-out-human false-positives, the bar that matters when a false accusation is costly.
+    feat_dir = {k: (1 if a > 0.5 else -1) for disc, a, k, hm, am, cat in rows if disc >= 0.10}
+    def _flags(doc, ref):
+        n = 0
+        for k, d in feat_dir.items():
+            vals = [f[k] for f in ref]
+            if not vals: continue
+            if (doc[k] > pctl(vals, 80)) if d > 0 else (doc[k] < pctl(vals, 20)): n += 1
+        return n
+    ai_fc = [_flags(f, HF) for f in AF]
+    hu_fc = [_flags(HF[i], HF[:i] + HF[i + 1:]) for i in range(len(HF))]
+    comp_auc = auc(ai_fc, hu_fc)
+    hmax = max(hu_fc) if hu_fc else 0
+    tpr_strict = sum(s > hmax for s in ai_fc) / len(ai_fc) if ai_fc else 0.0
+    print(f"\n== HONEST COMPOSITE (leave-one-out flag-count over {len(feat_dir)} discriminating features) ==")
+    print(f"  separation AUC: {comp_auc:.3f}   (human thresholds are leave-one-out, not in-sample)")
+    print(f"  TPR at zero held-out-human false-positives: {tpr_strict:.2f}  (n_human={len(HF)}; small n makes finer FPR points unresolvable)")
 
 # ════════════════════════════ LLM judge (semantic categories) ════════════════════════════
 # model context budgets (tokens) -- the REAL window, so we never truncate at an arbitrary char count
